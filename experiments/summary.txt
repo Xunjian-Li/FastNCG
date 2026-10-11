@@ -1,0 +1,13 @@
+FastNCG strongly convex chain experiment
+d=100, phi=4.0, nu=0.01, trials=500, seed=42
+x0=0.1*randn(MersenneTwister(seed),d); independent draws, no normalization
+gradient tolerance=1.0e-14, max_iter=500
+solver_kwargs=NamedTuple() (unspecified options use FastNCGSolver defaults)
+converged=500/500
+finite positive error pairs=5002, excluded=0
+log base=e, horizontal=log(error_n), vertical=log(error_n+1)
+pooled slope=2.1038090660328725, intercept=0.15614323770522365, R2=0.9993576432145341
+iteration range=10:11
+maximum final gradient=6.508504039266211e-15
+Pooled slope alone does not establish per-trajectory local quadratic convergence.
+Inspect local_order in error_pairs.csv; all runs and transient pairs are retained.

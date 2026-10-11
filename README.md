@@ -1,8 +1,22 @@
-# SRNCG.jl
+# FastNCG.jl
 
-**SRNCG.jl** is a Julia implementation of **SRN-CG**, a matrix-free second-order optimization method based on regularized Newton steps and adaptive Krylov subspace approximations.
+The local package/module is now `FastNCG` and the solver type is
+`FastNCGSolver`. Restart Julia after migrating, activate this project, then use:
 
-The method is designed for large-scale smooth optimization problems where explicitly forming or factorizing the Hessian is expensive or impractical. Instead of constructing the full Hessian matrix, SRN-CG accesses second-order information through **Hessian-vector products (HVPs)** and constructs a low-dimensional Lanczos/Krylov approximation of the regularized Newton system.
+```julia
+using FastNCG
+solver = FastNCGSolver()
+```
+
+Julia cannot define a type named `FastNCG` inside the module `FastNCG`, so the
+qualified constructor is `FastNCG.FastNCGSolver()`. The package UUID is unchanged.
+The existing GitHub repository URL below is retained; this local rename does not
+rename or publish that remote repository. Until the changes are published, use
+the local checkout with `julia --project=.` or `Pkg.develop(path="/path/to/checkout")`.
+
+**FastNCG.jl** is a Julia implementation of **FastNCG**, a matrix-free second-order optimization method based on regularized Newton steps and adaptive Krylov subspace approximations.
+
+The method is designed for large-scale smooth optimization problems where explicitly forming or factorizing the Hessian is expensive or impractical. Instead of constructing the full Hessian matrix, FastNCG accesses second-order information through **Hessian-vector products (HVPs)** and constructs a low-dimensional Lanczos/Krylov approximation of the regularized Newton system.
 
 The package is built on top of [`NLPModels.jl`](https://github.com/JuliaSmoothOptimizers/NLPModels.jl) and can be used either with an `NLPModels`-compatible optimization model or with the lightweight `ClosureNLPModel` interface provided in this repository.
 
@@ -10,7 +24,7 @@ The package is built on top of [`NLPModels.jl`](https://github.com/JuliaSmoothOp
 
 ## Features
 
-SRNCG.jl provides:
+FastNCG.jl provides:
 
 - matrix-free second-order optimization;
 - Hessian-vector-product-based computation;
@@ -63,7 +77,7 @@ Pkg.add(url="https://github.com/Xunjian-Li/SRNCG.git")
 Then load the package with
 
 ```julia
-using SRNCG
+using FastNCG
 ```
 
 If the repository name or GitHub username is different, replace the URL accordingly.
@@ -73,8 +87,8 @@ If the repository name or GitHub username is different, replace the URL accordin
 If you want to modify the source code, clone the repository and activate it locally:
 
 ```bash
-git clone https://github.com/Xunjian-Li/SRNCG.git
-cd SRNCG
+git clone https://github.com/Xunjian-Li/SRNCG.git FastNCG
+cd FastNCG
 ```
 
 Start Julia with the project environment:
@@ -90,17 +104,17 @@ using Pkg
 Pkg.instantiate()
 ```
 
-and load SRNCG:
+and load FastNCG:
 
 ```julia
-using SRNCG
+using FastNCG
 ```
 
 Alternatively, from another Julia environment you can use
 
 ```julia
 using Pkg
-Pkg.develop(path="/path/to/SRNCG")
+Pkg.develop(path="/path/to/FastNCG")
 ```
 
 ---
@@ -110,9 +124,9 @@ Pkg.develop(path="/path/to/SRNCG")
 The basic workflow is
 
 ```julia
-using SRNCG
+using FastNCG
 
-solver = SRN_CG()
+solver = FastNCGSolver()
 
 x = optimize!(
     solver,
@@ -136,7 +150,7 @@ The returned value `x` is the final iterate.
 
 # Defining a Problem
 
-SRN-CG requires three basic operations:
+FastNCG requires three basic operations:
 
 1. objective evaluation
    \[
@@ -155,7 +169,7 @@ SRN-CG requires three basic operations:
 
 The full Hessian matrix does not need to be formed.
 
-SRNCG.jl provides `ClosureNLPModel` to conveniently wrap these three operations into an `NLPModels` model.
+FastNCG.jl provides `ClosureNLPModel` to conveniently wrap these three operations into an `NLPModels` model.
 
 ---
 
@@ -181,10 +195,10 @@ and
 \nabla^2 f(x)v=Av.
 \]
 
-A complete SRN-CG example is:
+A complete FastNCG example is:
 
 ```julia
-using SRNCG
+using FastNCG
 using LinearAlgebra
 using Random
 
@@ -221,7 +235,7 @@ nlp = ClosureNLPModel(
     name="Quadratic",
 )
 
-solver = SRN_CG(max_outer=1000)
+solver = FastNCGSolver(max_outer=1000)
 
 x = optimize!(
     solver,
@@ -324,13 +338,13 @@ For large-scale applications, `hprod_fn` should preferably compute the HVP direc
 Create a solver with
 
 ```julia
-solver = SRN_CG()
+solver = FastNCGSolver()
 ```
 
 The current constructor is
 
 ```julia
-SRN_CG(
+FastNCGSolver(
     sigma_0_ref = 1.0,
     sigma_min   = 1e-8,
     rho         = 2.0,
@@ -340,6 +354,7 @@ SRN_CG(
     max_outer   = 500,
     max_krylov  = 0,
     max_newton  = 10,
+    max_regularization_retries = 50,
     tol_newton  = 1e-3,
     verbose     = false,
 )
@@ -357,10 +372,35 @@ x = optimize!(
 )
 ```
 
+`max_regularization_retries` limits increases of `sigma` per outer iteration,
+independently of Krylov dimension. A value of zero permits the initial `sigma`
+only. Krylov extensions do not consume this retry budget.
+
+After a solve, `solver.status` is `:first_order` when the gradient tolerance is
+met, `:max_iter` when the outer iteration limit is reached, or `:inner_failure`
+when no acceptable step is found within the regularization retry budget.
+`:numerical_stagnation` indicates that adding the computed step leaves every
+coordinate unchanged in floating-point arithmetic; no trial callbacks are
+evaluated in this case. It does not imply convergence.
+`optimize!` continues to return the solution vector. If `initial_theta` is
+omitted, it starts from a copy of `nlp.meta.x0` without modifying the model's
+saved initial point.
+
+The objective-difference callback is evaluated only after the projection and
+gradient conditions pass. When a finite `objdiff_fn` result is available, it supplies the stable objective
+difference for the sufficient-decrease test. Otherwise, a trial must show a
+strictly negative computed objective difference and satisfy sufficient decrease.
+A quadratic model prediction cannot substitute for observed decrease. For
+objectives with a large constant offset or very small decreases near convergence,
+provide `objdiff_fn`; rounded-to-zero differences are rejected.
+
+Krylov basis storage starts with at most 17 columns and grows as needed, up to
+`max_krylov + 1`. The maximum allowed Krylov dimension is unchanged.
+
 For example, verbose output can be enabled with
 
 ```julia
-solver = SRN_CG(verbose=true)
+solver = FastNCGSolver(verbose=true)
 ```
 
 ---
@@ -434,7 +474,7 @@ make_tregression
 For example:
 
 ```julia
-using SRNCG
+using FastNCG
 
 x0, obj_fn, grad_fn!, hprod_fn! =
     make_rosenbrock(1000; x0=zeros(1000))
@@ -447,7 +487,7 @@ nlp = ClosureNLPModel(
     name="Rosenbrock",
 )
 
-solver = SRN_CG(max_outer=10_000)
+solver = FastNCGSolver(max_outer=10_000)
 
 x = optimize!(
     solver,
@@ -460,64 +500,47 @@ x = optimize!(
 
 ---
 
-# Regression Test
+# Tests and Regression
 
-The repository contains a deterministic regression test that checks the current SRN-CG implementation against frozen numerical reference results.
-
-The regression suite uses:
-
-| Problem | Dimension / Parameters |
-|---|---|
-| Rosenbrock | \(d=1000\) |
-| Log-Sum-Exp | \(d=200,\ n=1000,\ \rho=0.05\) |
-| Polytope | \(d=400,\ m=500,\ p=4\) |
-| T-Regression | \(d=200,\ m=500,\ \nu=0.001\) |
-
-The stopping tolerance is
-
-\[
-\|\nabla f(x)\| \le 10^{-7}.
-\]
-
-## Run from Julia
-
-From the repository root:
-
-```julia
-using Pkg
-Pkg.activate(".")
-
-using SRNCG
-
-include("test/test.jl")
-```
-
-## Run from the command line
+Run the tests from the repository root:
 
 ```bash
+julia --project=. test/runtests.jl
+julia --project=. test/ancg_adapter.jl
 julia --project=. test/test.jl
 ```
 
-A successful regression run should produce results consistent with:
+`runtests.jl` covers problem derivatives/caches, FastNCG acceptance and stopping
+behavior, workspace operations, and the ANCG reference branches. The separate
+adapter test checks ANCG model integration and evaluation counters.
 
-```text
-Problem         Iter      HVP      Obj     Grad
-------------------------------------------------
-Rosenbrock      2517    15148     7566     7566
-LogSumExp         54      419      206      206
-Polytope          51       98      112      112
-TRegression      193     1230      708      708
-```
+`test/test.jl` compares four deterministic runs against the current numerical
+baseline, refreshed on 2026-10-10 using Julia 1.12.6 and OpenBLAS ILP64. It fixes
+BLAS to one thread during the test and restores the previous setting afterward.
+The refreshed baseline was verified in a separate run, which exited successfully:
 
-and end with
+| Problem | Parameters | Iter | HVP | Obj | Grad | Final loss | Gradient norm | Regression |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Rosenbrock | d=1000 | 2517 | 15149 | 7567 | 7567 | 1.4715e-22 | 4.1313e-10 | PASS |
+| LogSumExp | d=200, n=1000, rho=0.05 | 55 | 425 | 196 | 196 | 1.4623e+00 | 1.5021e-08 | PASS |
+| Polytope | d=400, m=500, p=4 | 47 | 79 | 89 | 89 | 1.4004e-09 | 9.8264e-08 | PASS |
+| TRegression | d=200, m=500, nu=0.001 | 173 | 1201 | 646 | 646 | 1.4160e+03 | 7.4288e-08 | PASS |
 
-```text
-PASS.
-```
+Iteration and oracle counts must still match exactly; numerical comparison
+tolerances remain `rtol=5e-5`, `atol=1e-14`. The test additionally requires
+`:first_order` status, a final gradient norm at most `1e-7`, finite final iterates
+and objective/gradient histories, and nonincreasing loss.
 
-These reference values are intended to detect unintended changes in the numerical trajectory of the implementation.
+The solver algorithm and problem/solver configurations were not changed by this
+baseline refresh. Passing verifies agreement with the current baseline, not the
+older implementation. In particular, TRegression's old loss was approximately
+1390.4, versus 1416.0 now; this refresh does not establish improved objective
+quality or agreement with the old solution.
 
-Small wall-clock timing differences across machines are expected.
+This script deliberately tests only the objective, gradient and HVP callbacks;
+it omits `objdiff_fn`, unlike the benchmark. Its trajectory can also depend on
+Julia/BLAS versions and hardware despite the fixed thread count.
+See [test/README.md](test/README.md) for test roles and baseline history.
 
 ---
 
@@ -532,13 +555,16 @@ benchmark/benchmark.jl
 The current benchmark compares
 
 - **ARCqK**
-- **SRN-CG**
+- **FastNCG**
 - **Gradient Descent (GD)**
 - **Nesterov Accelerated Gradient (NAG)**
 - **ANCG**
 - **ARNCG**
 
-on the same four test problems.
+on the same four test problems. FastNCG is the benchmark name for the solver
+constructed with `FastNCG.FastNCGSolver`. The package/module is `FastNCG`;
+the solver type is `FastNCGSolver` because Julia modules and types cannot share
+a binding in the same namespace.
 
 The benchmark uses a common first-order tolerance
 
@@ -581,7 +607,7 @@ From Julia:
 using Pkg
 Pkg.activate(".")
 
-using SRNCG
+using FastNCG
 
 include("benchmark/benchmark.jl")
 ```
@@ -666,11 +692,43 @@ A run is reported as converged when the final gradient norm satisfies the benchm
 
 The benchmark contains implementations of several comparison methods.
 
-The ARNCG implementation used in the benchmark is a Julia translation based directly on the authors' MATLAB implementation, including the corresponding CappedCG procedure and adaptive regularized Newton logic.
+The ANCG implementation is a source-faithful Julia translation of the authors'
+`ANCG.m` and `capCG.m`, pinned to commit
+`45532f314fbf2f0c064f676c64bb9e53db0c6ee6`. It uses explicit Hessians, including
+in the benchmark adapter. Source provenance, preserved upstream quirks, parameter
+mapping, and validation limits are documented in
+[the ANCG reference notes](benchmark/reference/ancg/README.md).
 
-The benchmark implementations are included for numerical comparison and are not part of the core SRNCG API.
+For ANCG, the summary HVP count includes both CG matrix-vector products and HVPs
+used to reconstruct Hessians from the problem interface. Their separate counts,
+all loss/gradient/parameter histories, and the original stop reason are available
+in `rows[i].details`. The reported runtime includes reconstruction. This is not
+a matrix-free implementation, nor a measurement of native MATLAB performance.
 
-Users interested only in SRN-CG do not need to use these benchmark routines.
+Run `julia --project=. benchmark/benchmark.jl` to execute the full benchmark.
+When loading it with `include`, call `rows = main()` explicitly.
+
+The ARNCG implementation follows the authors' MATLAB `recompute` implementation,
+pinned to commit `8605f1e13386f3d0908a3d4a6dce9ce555d890bf`. The default is their
+experimental ARNCG_g configuration with theta=1 and lambda=0 (fallback disabled).
+Iterations count executed outer steps, including rejected steps, and HVP counts
+include every actual product. See the [reference notes](benchmark/reference/arncg/README.md)
+and [MATLAB comparison](test/arncg_cross_language/README.md) for preserved source
+behavior and validation limits.
+
+ARCqK uses `AdaptiveRegularization.jl` 0.2.2 with the settings from its
+`paper/benchmark_arctr.jl`: shifts `10 .^ (-10:0.5:20)`, zeta=0.5, initial
+alpha=10, acceptance thresholds 0.1/0.75, and decrease/increase factors 0.1/5.
+The old `TrustRegion` constructor in that reproduction script maps to the
+current `ARTrustRegion` constructor. The benchmark retains the shared absolute
+gradient tolerance 1e-7 (relative tolerance zero), and its ARCqK time budget of
+120 seconds. Thus this compares the paper's method/configuration on our problems;
+it does not reproduce the paper's stopping tolerances, time budget, or tables.
+
+The comparison algorithms live in `src` and are exported by FastNCG.
+The benchmark script handles problem construction, scheduling, timing and reporting.
+
+Users interested only in FastNCG do not need to use these benchmark routines.
 
 ---
 
@@ -679,33 +737,36 @@ Users interested only in SRN-CG do not need to use these benchmark routines.
 The current repository is organized as
 
 ```text
-SRNCG/
+FastNCG/
 ├── Project.toml
 ├── Manifest.toml
-├── test.jl
-├── benchmark.jl
+├── test/
+│   ├── runtests.jl
+│   └── test.jl
+├── benchmark/
+│   └── benchmark.jl
 ├── README.md
 └── src/
-    ├── SRNCG.jl
-    ├── SRN_CG.jl
+    ├── FastNCG.jl
+    ├── Fast_NCG.jl
     └── problems.jl
 ```
 
 The files have the following roles.
 
-### `src/SRNCG.jl`
+### `src/FastNCG.jl`
 
 Main package module.
 
-It loads the SRN-CG implementation and the included test-problem constructors.
+It loads the FastNCG implementation and the included test-problem constructors.
 
-### `src/SRN_CG.jl`
+### `src/Fast_NCG.jl`
 
-Core SRN-CG implementation.
+Core FastNCG implementation.
 
 This file contains:
 
-- `SRN_CG`
+- `FastNCGSolver`
 - `ClosureNLPModel`
 - `optimize!`
 - Lanczos/Krylov operations
@@ -725,30 +786,31 @@ make_tregression
 
 ### `test/test.jl`
 
-Deterministic regression tests against frozen SRN-CG reference results.
+Deterministic numerical regression against the baseline refreshed on 2026-10-10.
+All four problems pass; use `test/runtests.jl` for the complementary correctness suite.
 
 ### `benchmark/benchmark.jl`
 
-Benchmark suite comparing SRN-CG with other optimization methods.
+Benchmark suite comparing FastNCG with other optimization methods.
 
 ---
 
-# Using SRN-CG in Your Own Code
+# Using FastNCG in Your Own Code
 
 For most users, only three objects are needed:
 
 ```julia
-using SRNCG
+using FastNCG
 
 ClosureNLPModel
-SRN_CG
+FastNCGSolver
 optimize!
 ```
 
 A typical application therefore has the following structure:
 
 ```julia
-using SRNCG
+using FastNCG
 
 # 1. Define objective
 function f(x)
@@ -779,8 +841,8 @@ nlp = ClosureNLPModel(
     name="MyProblem",
 )
 
-# 6. Construct SRN-CG solver
-solver = SRN_CG()
+# 6. Construct FastNCG solver
+solver = FastNCGSolver()
 
 # 7. Optimize
 x = optimize!(
@@ -805,7 +867,7 @@ Hv_f!(Hv, x, v)
 
 rather than an explicit Hessian matrix.
 
-This is the intended use case of SRN-CG for large-scale problems.
+This is the intended use case of FastNCG for large-scale problems.
 
 ---
 
@@ -813,7 +875,7 @@ This is the intended use case of SRN-CG for large-scale problems.
 
 The supplied stochastic test problems use fixed random seeds where applicable.
 
-The regression suite checks deterministic quantities such as:
+The `test/test.jl` regression checks quantities such as:
 
 - iteration counts;
 - Hessian-vector-product counts;
@@ -830,15 +892,15 @@ For reliable benchmark timing, it is recommended to run the benchmark in a fresh
 
 # Citation
 
-If you use SRNCG.jl in academic work, please cite the accompanying SRN-CG paper.
+If you use FastNCG.jl in academic work, please cite the accompanying FastNCG paper.
 
 The full citation will be added when the manuscript is publicly available.
 
 A BibTeX entry will be provided here:
 
 ```bibtex
-@article{SRNCG,
-  title   = {SRN-CG},
+@article{FastNCG,
+  title   = {FastNCG},
   author  = {Xun-Jian Li and coauthors},
   journal = {...},
   year    = {...}
@@ -879,3 +941,49 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Algorithm source layout
+
+- `src/Fast_NCG.jl`: FastNCGSolver and the closure-model interface.
+- `src/GD.jl`, `src/NAG.jl`, `src/CR.jl`: respective comparison solvers.
+- `src/ANCG.jl`: ANCG reference core and model adapter in one file.
+- `src/ARNCG.jl`: authors' ARNCG translation.
+- `src/ARCqK.jl`: ARCqK package adapter and paper configuration.
+- `src/results.jl`: common `OptResult` output.
+- `benchmark/benchmark.jl`: shared benchmark policy and orchestration only.
+
+The relocation preserves solver defaults, arithmetic, branch order, counters and
+termination conditions. It does not add ANCG stagnation or time-limit guards.
+`Fast_NCG.jl` is the source filename; the exported constructor remains
+`FastNCGSolver`. ANCG is loaded through the FastNCG package; no benchmark compatibility files are needed.
+
+## Strongly convex local-convergence experiment
+
+Run only FastNCG on the regularized power-chain problem:
+
+```sh
+julia --project=. experiments/strongly_convex.jl
+```
+
+The standalone script implements the objective, analytic gradient, HVP, and
+stable objective difference. Defaults: d=100, phi=4, nu=0.01, 500 Gaussian
+starts scaled by 0.1, seed=42, and gradient tolerance 1e-14. It records accepted
+outer iterates without modifying the solver. Results (CSVs, summary, PNG and
+PDF) are written to `experiments/results/strongly_convex/`.
+Plotting uses Julia `Plots.jl` (GR backend). To compute data only or customize:
+
+```julia
+include("experiments/strongly_convex.jl")
+results = StronglyConvexExperiment.run_experiment(; trials=500, plot=false)
+```
+
+The fitted slope is computed from the actual data; it is not fixed to the
+manuscript's 2.070. Local order estimates are included in `error_pairs.csv`.
+
+To redraw the saved convergence figure in Julia without rerunning the 500 trials:
+
+```julia
+include("experiments/strongly_convex.jl")
+fig = StronglyConvexExperiment.plot_results()
+display(fig)
+```

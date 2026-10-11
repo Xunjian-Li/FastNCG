@@ -2,27 +2,31 @@ using LinearAlgebra
 using Random
 using Printf
 using NLPModels
+using FastNCG
 
+# Baseline refreshed on 2026-10-10, Julia 1.12.6 / OpenBLAS ILP64, one thread.
+# Deliberately tests the objective/gradient/HVP-only interface (no objdiff_fn).
+# Keep exact oracle counts and the existing numerical comparison tolerances.
 const REFERENCES = Dict(
     "Rosenbrock" => (
-        iter=2517, hvp=15148, nobj=7566, ngrad=7566,
-        f=3.17346662737801853e-24,
-        g=3.59321285318693075e-11,
+        iter=2517, hvp=15149, nobj=7567, ngrad=7567,
+        f=1.4714557568952127e-22,
+        g=4.1312684306971754e-10,
     ),
     "LogSumExp" => (
-        iter=54, hvp=419, nobj=206, ngrad=206,
-        f=1.462335784021944,
-        g=8.358669231604742e-8,
+        iter=55, hvp=425, nobj=196, ngrad=196,
+        f=1.4623357840219477,
+        g=1.5020883855925921e-8,
     ),
     "Polytope" => (
-        iter=51, hvp=98, nobj=112, ngrad=112,
-        f=9.23044694464708764e-12,
-        g=4.65727981150681864e-08,
+        iter=47, hvp=79, nobj=89, ngrad=89,
+        f=1.4004233017722169e-9,
+        g=9.8264333066183967e-8,
     ),
     "TRegression" => (
-        iter=193, hvp=1230, nobj=708, ngrad=708,
-        f=1.39040741191090160e+03,
-        g=2.50859371341009197e-08,
+        iter=173, hvp=1201, nobj=646, ngrad=646,
+        f=1416.0209426997492,
+        g=7.4287706408049945e-8,
     ),
 )
 
@@ -44,16 +48,16 @@ function build_problems()
     return problems
 end
 
-function run_srncg(problem)
-    nlp = SRNCG.ClosureNLPModel(
+function run_fastncg(problem)
+    nlp = FastNCG.ClosureNLPModel(
         copy(problem.x0), problem.obj, problem.grad, problem.hprod;
         name=problem.name,
     )
 
-    solver = SRNCG.SRN_CG(max_outer=10000)
+    solver = FastNCG.FastNCGSolver(max_outer=10000)
     reset!(nlp)
 
-    elapsed = @elapsed x = SRNCG.optimize!(
+    elapsed = @elapsed x = FastNCG.optimize!(
         solver, nlp;
         initial_theta=copy(problem.x0),
         max_iter=10000,
@@ -68,6 +72,10 @@ function run_srncg(problem)
 
     return (
         time=elapsed,
+        status=solver.status,
+        finite_iterates=all(isfinite,x) && all(isfinite,solver.loss_history) &&
+                        all(isfinite,solver.grad_norm_history),
+        decreasing_loss=all(diff(solver.loss_history) .<= 0),
         f=f_final,
         g=g_final,
         iter=length(solver.loss_history) - 1,
@@ -80,9 +88,19 @@ end
 same_float(a, b; rtol=5e-5, atol=1e-14) =
     isapprox(a, b; rtol=rtol, atol=atol)
 
-function main()
+function regression_pass(r, ref)
+    counts_ok = r.iter == ref.iter && r.hvp == ref.hvp &&
+                r.nobj == ref.nobj && r.ngrad == ref.ngrad
+    values_ok = same_float(r.f, ref.f) && same_float(r.g, ref.g)
+    solution_ok = r.status == :first_order && isfinite(r.f) &&
+                  isfinite(r.g) && 0 <= r.g <= 1e-7 &&
+                  r.finite_iterates && r.decreasing_loss
+    return counts_ok && values_ok && solution_ok
+end
+
+function _run_regression()
     println("="^110)
-    println("SRN-CG clean GitHub build: regression check against frozen production reference")
+    println("FastNCG regression: current baseline (2026-10-10), one BLAS thread")
     println("="^110)
     @printf("%-14s %9s %9s %9s %9s %13s %13s %10s %10s\n",
             "Problem", "Iter", "HVP", "Obj", "Grad", "f(x*)", "|g(x*)|", "Time(s)", "Status")
@@ -91,20 +109,10 @@ function main()
     all_pass = true
 
     for p in build_problems()
-        r = run_srncg(p)
+        r = run_fastncg(p)
         ref = REFERENCES[p.name]
 
-        counts_ok =
-            r.iter == ref.iter &&
-            r.hvp == ref.hvp &&
-            r.nobj == ref.nobj &&
-            r.ngrad == ref.ngrad
-
-        values_ok =
-            same_float(r.f, ref.f) &&
-            same_float(r.g, ref.g)
-
-        pass = counts_ok && values_ok
+        pass = regression_pass(r, ref)
         all_pass &= pass
 
         @printf("%-14s %9d %9d %9d %9d %13.4e %13.4e %10.4f %10s\n",
@@ -112,6 +120,8 @@ function main()
                 r.f, r.g, r.time, pass ? "PASS" : "FAIL")
 
         if !pass
+            println("  solver status=", r.status, ", finite iterates=", r.finite_iterates,
+                    ", decreasing loss=", r.decreasing_loss)
             @printf("  reference: Iter=%d HVP=%d Obj=%d Grad=%d f=%.4e |g|=%.4e\n",
                     ref.iter, ref.hvp, ref.nobj, ref.ngrad, ref.f, ref.g)
         end
@@ -121,10 +131,20 @@ function main()
     if all_pass
         println("PASS.")
     else
-        println("FAIL: at least one trajectory/result differs from the frozen reference.")
-        error("SRN-CG regression check failed.")
+        println("FAIL: reference mismatch or invalid/nonconverged solution.")
+        error("FastNCG regression check failed.")
     end
     println("="^110)
+end
+
+function main()
+    previous_threads = BLAS.get_num_threads()
+    try
+        BLAS.set_num_threads(1)
+        _run_regression()
+    finally
+        BLAS.set_num_threads(previous_threads)
+    end
 end
 
 main()

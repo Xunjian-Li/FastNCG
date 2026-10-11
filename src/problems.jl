@@ -1,319 +1,687 @@
 using LinearAlgebra
 using Random
-using Printf
-using NLPModels
 
 export make_rosenbrock, make_logsumexp, make_polytope, make_tregression
 
-import NLPModels: reset!, obj, grad
-
-function make_rosenbrock(dim::Int = 200; x0 = ones(dim) * 2)
-    function my_obj(x)
-        s = 0.0
-        @inbounds for i in 1:length(x)-1
-            s += 100.0 * (x[i+1] - x[i]^2)^2 + (1.0 - x[i])^2
-        end
-        return s
+# Compare values, not object identity: solvers reuse and mutate their x buffers.
+# An explicit loop avoids allocating the broadcast temporary in all(a .== b).
+@inline function _same_problem_point(a, b)
+    axes(a) == axes(b) || return false
+    @inbounds for i in eachindex(a, b)
+        a[i] == b[i] || return false
     end
+    return true
+end
+
+# Each factory owns mutable workspaces; use a separate instance per concurrent solve.
+
+# ============================================================
+# Rosenbrock
+# ============================================================
+
+function make_rosenbrock(dim::Int=200; x0=ones(dim) .* 2.0)
+    x0 = Vector{Float64}(x0)
+
+    function my_obj(x)
+        total = 0.0
+        @inbounds @simd for i in 1:(dim - 1)
+            r = x[i + 1] - x[i]^2
+            total += 100.0 * r^2 + (1.0 - x[i])^2
+        end
+        return total
+    end
+
     function my_grad!(g, x)
-        n = length(x)
         fill!(g, 0.0)
-        @inbounds for i in 1:n-1
-            g[i]   += -400.0 * x[i] * (x[i+1] - x[i]^2) - 2.0 * (1.0 - x[i])
-            g[i+1] +=  200.0 * (x[i+1] - x[i]^2)
+
+        @inbounds for i in 1:(dim - 1)
+            xi = x[i]
+            xip1 = x[i + 1]
+            r = xip1 - xi^2
+
+            g[i] += -400.0 * xi * r + 2.0 * (xi - 1.0)
+            g[i + 1] += 200.0 * r
         end
+
+        return g
     end
+
     function my_hprod!(Hv, x, v)
-        n = length(x)
         fill!(Hv, 0.0)
-        @inbounds for i in 1:n-1
-            t = x[i+1] - x[i]^2
-            Hv[i]   += (-400.0 * t + 800.0 * x[i]^2 + 2.0) * v[i]
-            Hv[i]   += (-400.0 * x[i]) * v[i+1]
-            Hv[i+1] += (-400.0 * x[i]) * v[i]
-            Hv[i+1] += ( 200.0) * v[i+1]
-        end
-    end
-    return x0, my_obj, my_grad!, my_hprod!
-end
 
-function make_logsumexp(dim::Int = 200, n::Int = 1000, rho::Float64 = 0.05;
-                        seed::Int = 42, x0 = zeros(dim))
-    rng = MersenneTwister(seed)
-    A = randn(rng, n, dim)
-    b = randn(rng, n)
+        @inbounds for i in 1:(dim - 1)
+            xi = x[i]
+            xip1 = x[i + 1]
 
-    # Objective -> gradient cache.
-    # Only z = A*x - b is shared. The validated gradient arithmetic
-    # (maximum, exp, sum, normalization, and A' * w) remains unchanged.
-    obj_linear = Vector{Float64}(undef, n)
-    grad_linear = Vector{Float64}(undef, n)
-    grad_w = Vector{Float64}(undef, n)
-    obj_x = similar(x0)
-    obj_x_valid = Ref(false)
+            h11 = 1200.0 * xi^2 - 400.0 * xip1 + 2.0
+            h12 = -400.0 * xi
 
-    function my_obj(x)
-        mul!(obj_linear, A, x)
-        @inbounds @simd for i in eachindex(obj_linear, b)
-            obj_linear[i] -= b[i]
+            Hv[i] += h11 * v[i] + h12 * v[i + 1]
+            Hv[i + 1] += h12 * v[i] + 200.0 * v[i + 1]
         end
 
-        # Cache the point associated with obj_linear and grad_w.
-        copyto!(obj_x, x)
-        obj_x_valid[] = true
-
-        mx = maximum(obj_linear)
-        s = 0.0
-        @inbounds @simd for i in eachindex(obj_linear, grad_w)
-            wi = exp((obj_linear[i] - mx) / rho)
-            grad_w[i] = wi
-            s += wi
-        end
-        return rho * (log(s) + mx / rho)
-    end
-
-    function my_grad!(g, x)
-        if obj_x_valid[] && isequal(x, obj_x)
-            # Fused objective-gradient path:
-            # obj_linear and the unnormalized exponentials in grad_w
-            # were already computed by my_obj at exactly this x.
-            copyto!(grad_linear, obj_linear)
-        else
-            # Preserve the original standalone-gradient path.
-            mul!(grad_linear, A, x)
-            @inbounds @simd for i in eachindex(grad_linear, b)
-                grad_linear[i] -= b[i]
-            end
-            mx = maximum(grad_linear)
-            @inbounds @simd for i in eachindex(grad_w, grad_linear)
-                grad_w[i] = exp((grad_linear[i] - mx) / rho)
-            end
-        end
-
-        # Preserve the validated normalization and A' * w arithmetic.
-        sw = sum(grad_w)
-        @inbounds @simd for i in eachindex(grad_w)
-            grad_w[i] /= sw
-        end
-
-        mul!(g, transpose(A), grad_w)
-        return g
-    end
-
-    # HVP cache: w(x) and A'w(x) are constant for all Lanczos products
-    # performed at the same outer iterate x.
-    hess_x = similar(x0)
-    hess_x_valid = Ref(false)
-    hess_w = Vector{Float64}(undef, n)
-    hess_Atw = Vector{Float64}(undef, dim)
-    hess_linear = Vector{Float64}(undef, n)
-    hess_Av = Vector{Float64}(undef, n)
-    hess_tmp = Vector{Float64}(undef, n)
-
-    function refresh_hess_cache!(x)
-        if !hess_x_valid[] || !isequal(x, hess_x)
-            mul!(hess_linear, A, x)
-            @inbounds @simd for i in eachindex(hess_linear, b)
-                hess_linear[i] -= b[i]
-            end
-            mx = maximum(hess_linear)
-            sw = 0.0
-            @inbounds for i in eachindex(hess_w, hess_linear)
-                wi = exp((hess_linear[i] - mx) / rho)
-                hess_w[i] = wi
-                sw += wi
-            end
-            invsw = inv(sw)
-            @inbounds @simd for i in eachindex(hess_w)
-                hess_w[i] *= invsw
-            end
-            mul!(hess_Atw, transpose(A), hess_w)
-            copyto!(hess_x, x)
-            hess_x_valid[] = true
-        end
-        return nothing
-    end
-
-    function my_hprod!(Hv, x, v)
-        refresh_hess_cache!(x)
-        mul!(hess_Av, A, v)
-        wAv = dot(hess_w, hess_Av)
-        @inbounds @simd for i in eachindex(hess_tmp, hess_w, hess_Av)
-            hess_tmp[i] = hess_w[i] * hess_Av[i]
-        end
-        mul!(Hv, transpose(A), hess_tmp)
-        @inbounds @simd for i in eachindex(Hv, hess_Atw)
-            Hv[i] = (Hv[i] - hess_Atw[i] * wAv) / rho
-        end
         return Hv
     end
-    return x0, my_obj, my_grad!, my_hprod!
+
+    function my_objdiff(x, trial)
+        total = 0.0
+        correction = 0.0
+
+        @inbounds for i in 1:(dim - 1)
+            xi = x[i]
+            xip1 = x[i + 1]
+            yi = trial[i]
+            yip1 = trial[i + 1]
+
+            rx = xip1 - xi^2
+            ry = yip1 - yi^2
+
+            t = 100.0 * (ry - rx) * (ry + rx) +
+                (xi - yi) * (2.0 - xi - yi)
+
+            z = total + t
+            correction += abs(total) >= abs(t) ? (total - z) + t : (t - z) + total
+            total = z
+        end
+
+        return total + correction, nothing
+    end
+
+    return x0, my_obj, my_grad!, my_hprod!, my_objdiff
 end
 
-function make_polytope(dim::Int = 400, m::Int = 1000, p::Int = 3;
-                       seed::Int = 42, x0 = ones(dim))
+
+# ============================================================
+# LogSumExp
+# ============================================================
+
+function make_logsumexp(dim::Int=200, m::Int=1000, rho::Float64=0.05;
+                        seed::Int=42, x0=zeros(dim))
     rng = MersenneTwister(seed)
-    A = randn(rng, m, dim)
+
+    A = randn(rng, m, dim) ./ sqrt(dim)
     b = randn(rng, m)
+    x0 = Vector{Float64}(x0)
 
-    res   = Vector{Float64}(undef, m)
-    coeff = Vector{Float64}(undef, m)
-    Av    = Vector{Float64}(undef, m)
-    tmp_m = Vector{Float64}(undef, m)
-    obj_x = similar(x0)
+    # Latest objective/gradient point.
+    linear = zeros(m)
+    weights = zeros(m)
+    obj_x = zeros(dim)
     obj_x_valid = Ref(false)
+    obj_value = Ref(0.0)
 
-    function fill_res!(x)
-        mul!(res, A, x)
-        @inbounds @simd for i in eachindex(res, b)
-            res[i] -= b[i]
+    # Fixed outer/Hessian point.
+    hess_linear = zeros(m)
+    hess_w = zeros(m)
+    hess_x = zeros(dim)
+    hess_x_valid = Ref(false)
+
+    # Trial relative to the fixed Hessian point.
+    step = zeros(dim)
+    trial_d = zeros(m)
+    trial_x = zeros(dim)
+    trial_base_x = zeros(dim)
+    trial_d_valid = Ref(false)
+
+    # HVP workspaces.
+    Av = zeros(m)
+    tmp = zeros(m)
+
+    # objdiff fallback workspaces.
+    diff_linear = zeros(m)
+    diff_d = zeros(m)
+
+    function update_weights!(w, z)
+        zmax = maximum(z)
+
+        total = 0.0
+        @inbounds @simd for i in eachindex(z, w)
+            wi = exp((z[i] - zmax) / rho)
+            w[i] = wi
+            total += wi
         end
-        return res
+
+        invtotal = 1.0 / total
+        @inbounds @simd for i in eachindex(w)
+            w[i] *= invtotal
+        end
+
+        return zmax + rho * log(total)
     end
 
     function my_obj(x)
-        fill_res!(x)
-        copyto!(obj_x, x)
-        obj_x_valid[] = true
-        ss = 0.0
-        @inbounds @simd for i in eachindex(res)
-            r = res[i] > 0 ? res[i] : 0.0
-            ss += r^p
+        if !obj_x_valid[] || !_same_problem_point(x, obj_x)
+            if hess_x_valid[] && !_same_problem_point(x, hess_x)
+                @inbounds @simd for i in eachindex(step)
+                    step[i] = x[i] - hess_x[i]
+                end
+
+                mul!(trial_d, A, step)
+
+                @inbounds @simd for i in eachindex(linear, hess_linear, trial_d)
+                    linear[i] = hess_linear[i] + trial_d[i]
+                end
+
+                copyto!(trial_x, x)
+                copyto!(trial_base_x, hess_x)
+                trial_d_valid[] = true
+            elseif hess_x_valid[]
+                copyto!(linear, hess_linear)
+                trial_d_valid[] = false
+            else
+                mul!(linear, A, x)
+
+                @inbounds @simd for i in eachindex(linear, b)
+                    linear[i] -= b[i]
+                end
+
+                trial_d_valid[] = false
+            end
+
+            obj_value[] = update_weights!(weights, linear)
+            copyto!(obj_x, x)
+            obj_x_valid[] = true
         end
-        return ss
+
+        return obj_value[]
     end
 
     function my_grad!(g, x)
-        if !(obj_x_valid[] && isequal(x, obj_x))
-            fill_res!(x)
+        if !obj_x_valid[] || !_same_problem_point(x, obj_x)
+            my_obj(x)
         end
-        @inbounds @simd for i in eachindex(res, tmp_m)
-            r = res[i] > 0 ? res[i] : 0.0
-            tmp_m[i] = p * r^(p - 1)
-        end
-        mul!(g, transpose(A), tmp_m)
+
+        mul!(g, A', weights)
         return g
     end
 
-    hess_x = similar(x0)
-    hess_x_valid = Ref(false)
-    hess_coeff = similar(coeff)
-    hess_res = similar(res)
+    function my_hprod!(Hv, x, v)
+        if !hess_x_valid[] || !_same_problem_point(x, hess_x)
+            if obj_x_valid[] && _same_problem_point(x, obj_x)
+                copyto!(hess_linear, linear)
+                copyto!(hess_w, weights)
+            else
+                mul!(hess_linear, A, x)
 
-    function refresh_hess_cache!(x)
-        if !hess_x_valid[] || !isequal(x, hess_x)
-            mul!(hess_res, A, x)
-            @inbounds @simd for i in eachindex(hess_res, b)
-                hess_res[i] -= b[i]
+                @inbounds @simd for i in eachindex(hess_linear, b)
+                    hess_linear[i] -= b[i]
+                end
+                update_weights!(hess_w, hess_linear)
             end
-            @inbounds @simd for i in eachindex(hess_res, hess_coeff)
-                r = hess_res[i] > 0 ? hess_res[i] : 0.0
-                hess_coeff[i] = r > 0 ? p * (p - 1) * r^(p - 2) : 0.0
-            end
+
             copyto!(hess_x, x)
             hess_x_valid[] = true
+            trial_d_valid[] = false
+        end
+
+        mul!(Av, A, v)
+        c = dot(hess_w, Av)
+
+        @inbounds @simd for i in eachindex(tmp, hess_w, Av)
+            tmp[i] = hess_w[i] * (Av[i] - c) / rho
+        end
+
+        mul!(Hv, A', tmp)
+        return Hv
+    end
+
+    function my_objdiff(x, trial)
+        if hess_x_valid[] && _same_problem_point(x, hess_x) &&
+           trial_d_valid[] && _same_problem_point(trial, trial_x) &&
+           _same_problem_point(x, trial_base_x)
+
+            w = hess_w
+            d = trial_d
+
+            shift = -Inf
+            @inbounds for i in eachindex(w, d)
+                wi = w[i]
+                wi <= 0.0 && continue
+                t = log(wi) + d[i] / rho
+                t > shift && (shift = t)
+            end
+
+            !isfinite(shift) && return (NaN, Inf)
+
+            total = 0.0
+            @inbounds for i in eachindex(w, d)
+                wi = w[i]
+                wi <= 0.0 && continue
+                total += exp(log(wi) + d[i] / rho - shift)
+            end
+
+            delta = rho * (shift + log(total))
+            return delta, nothing
+        end
+
+        mul!(diff_linear, A, x)
+
+        @inbounds @simd for i in eachindex(diff_linear, b)
+            diff_linear[i] -= b[i]
+        end
+
+        @inbounds @simd for i in eachindex(step)
+            step[i] = trial[i] - x[i]
+        end
+
+        mul!(diff_d, A, step)
+
+        zmax = maximum(diff_linear)
+
+        denom = 0.0
+        @inbounds for i in eachindex(diff_linear)
+            denom += exp((diff_linear[i] - zmax) / rho)
+        end
+
+        shift = -Inf
+        @inbounds for i in eachindex(diff_linear, diff_d)
+            t = (diff_linear[i] - zmax + diff_d[i]) / rho
+            t > shift && (shift = t)
+        end
+
+        numer = 0.0
+        @inbounds for i in eachindex(diff_linear, diff_d)
+            numer += exp(
+                (diff_linear[i] - zmax + diff_d[i]) / rho - shift
+            )
+        end
+
+        delta = rho * (shift + log(numer) - log(denom))
+        return delta, nothing
+    end
+
+    return x0, my_obj, my_grad!, my_hprod!, my_objdiff
+end
+
+
+# ============================================================
+# Polytope
+# ============================================================
+
+function make_polytope(dim::Int=400, m::Int=1000, p::Int=3;
+                       seed::Int=42, x0=ones(dim))
+    rng = MersenneTwister(seed)
+
+    A = randn(rng, m, dim) ./ sqrt(dim)
+    b = randn(rng, m)
+    x0 = Vector{Float64}(x0)
+
+    # Latest objective/gradient point.
+    res = zeros(m)
+    obj_x = zeros(dim)
+    obj_x_valid = Ref(false)
+    obj_value = Ref(0.0)
+    obj_value_valid = Ref(false)
+
+    # Fixed outer/Hessian point.
+    hess_res = zeros(m)
+    hess_coeff = zeros(m)
+    hess_x = zeros(dim)
+    hess_x_valid = Ref(false)
+
+    # Trial relative to fixed Hessian point.
+    step = zeros(dim)
+    trial_d = zeros(m)
+    trial_x = zeros(dim)
+    trial_base_x = zeros(dim)
+    trial_d_valid = Ref(false)
+
+    # Gradient/HVP workspaces.
+    Av = zeros(m)
+    tmp = zeros(m)
+
+    # objdiff fallback.
+    diff_r = zeros(m)
+    diff_d = zeros(m)
+
+    function ensure_residual!(x)
+        if !obj_x_valid[] || !_same_problem_point(x, obj_x)
+            if hess_x_valid[] && !_same_problem_point(x, hess_x)
+                @inbounds @simd for i in eachindex(step)
+                    step[i] = x[i] - hess_x[i]
+                end
+
+                mul!(trial_d, A, step)
+
+                @inbounds @simd for i in eachindex(res, hess_res, trial_d)
+                    res[i] = hess_res[i] + trial_d[i]
+                end
+
+                copyto!(trial_x, x)
+                copyto!(trial_base_x, hess_x)
+                trial_d_valid[] = true
+            elseif hess_x_valid[]
+                copyto!(res, hess_res)
+                trial_d_valid[] = false
+            else
+                mul!(res, A, x)
+
+                @inbounds @simd for i in eachindex(res, b)
+                    res[i] -= b[i]
+                end
+
+                trial_d_valid[] = false
+            end
+
+            copyto!(obj_x, x)
+            obj_x_valid[] = true
+            obj_value_valid[] = false
         end
         return nothing
     end
 
-    function my_hprod!(Hv, x, v)
-        refresh_hess_cache!(x)
-        mul!(Av, A, v)
-        @inbounds @simd for i in eachindex(tmp_m, hess_coeff, Av)
-            tmp_m[i] = hess_coeff[i] * Av[i]
+    function my_obj(x)
+        ensure_residual!(x)
+        obj_value_valid[] && return obj_value[]
+        total = 0.0
+
+        @inbounds for i in eachindex(res)
+            ri = res[i]
+            ri > 0.0 && (total += ri^p)
         end
-        mul!(Hv, transpose(A), tmp_m)
+
+        obj_value[] = total
+        obj_value_valid[] = true
+        return total
+    end
+
+    function my_grad!(g, x)
+        ensure_residual!(x)
+
+        @inbounds for i in eachindex(res, tmp)
+            ri = res[i]
+            tmp[i] = ri > 0.0 ? p * ri^(p - 1) : 0.0
+        end
+
+        mul!(g, A', tmp)
+        return g
+    end
+
+    function my_hprod!(Hv, x, v)
+        if !hess_x_valid[] || !_same_problem_point(x, hess_x)
+            if obj_x_valid[] && _same_problem_point(x, obj_x)
+                copyto!(hess_res, res)
+            else
+                mul!(hess_res, A, x)
+
+                @inbounds @simd for i in eachindex(hess_res, b)
+                    hess_res[i] -= b[i]
+                end
+            end
+
+            @inbounds for i in eachindex(hess_res, hess_coeff)
+                ri = hess_res[i]
+
+                hess_coeff[i] =
+                    ri > 0.0 ?
+                    p * (p - 1) * ri^(p - 2) :
+                    0.0
+            end
+
+            copyto!(hess_x, x)
+            hess_x_valid[] = true
+            trial_d_valid[] = false
+        end
+
+        mul!(Av, A, v)
+
+        @inbounds @simd for i in eachindex(tmp, hess_coeff, Av)
+            tmp[i] = hess_coeff[i] * Av[i]
+        end
+
+        mul!(Hv, A', tmp)
         return Hv
     end
 
-    return x0, my_obj, my_grad!, my_hprod!
+    function my_objdiff(x, trial)
+        if hess_x_valid[] && _same_problem_point(x, hess_x) &&
+           trial_d_valid[] && _same_problem_point(trial, trial_x) &&
+           _same_problem_point(x, trial_base_x)
+
+            r = hess_res
+            d = trial_d
+        else
+            mul!(diff_r, A, x)
+
+            @inbounds @simd for i in eachindex(diff_r, b)
+                diff_r[i] -= b[i]
+            end
+
+            @inbounds @simd for i in eachindex(step)
+                step[i] = trial[i] - x[i]
+            end
+
+            mul!(diff_d, A, step)
+
+            r = diff_r
+            d = diff_d
+        end
+
+        total = 0.0
+        correction = 0.0
+
+        @inbounds for i in eachindex(r, d)
+            a = max(r[i], 0.0)
+            c = max(r[i] + d[i], 0.0)
+
+            if p == 2
+                t = (c - a) * (c + a)
+            elseif p == 3
+                t = (c - a) * (c^2 + c * a + a^2)
+            elseif p == 4
+                t = (c - a) * (c + a) * (c^2 + a^2)
+            else
+                t = c^p - a^p
+            end
+
+            z = total + t
+            correction += abs(total) >= abs(t) ? (total - z) + t : (t - z) + total
+            total = z
+        end
+
+        return total + correction, nothing
+    end
+
+    return x0, my_obj, my_grad!, my_hprod!, my_objdiff
 end
 
-function make_tregression(dim::Int = 200, m::Int = 500, nu::Float64 = 0.001;
-                          seed::Int = 42)
+
+# ============================================================
+# Student-t regression
+# ============================================================
+
+function make_tregression(dim::Int=200, m::Int=500, nu::Float64=0.001;
+                          seed::Int=42)
     rng = MersenneTwister(seed)
+
     x_true = randn(rng, dim)
-    A_raw = randn(rng, m, dim)
-    for i in 2:dim
-        A_raw[:, i] .+= 0.3 .* A_raw[:, i-1]
+
+    A = randn(rng, m, dim)
+
+    for j in 2:dim
+        A[:, j] .+= 0.3 .* A[:, j-1]
     end
-    A = A_raw ./ sqrt(1 + 0.3^2)
-    clean = A * x_true
-    z = randn(rng, m) .* 0.5
-    chi = rand(rng, m) .* 2.0
-    noise = z ./ sqrt.(chi)
-    b = clean .+ noise
+
+    A ./= sqrt(1.0 + 0.3^2)
+
+    noise = 0.5 .* randn(rng, m)
+    chi = 2.0 .* rand(rng, m)
+    b = A * x_true + noise ./ sqrt.(chi)
+
     x0 = A \ b
 
-    res   = Vector{Float64}(undef, m)
-    coeff = Vector{Float64}(undef, m)
-    Av    = Vector{Float64}(undef, m)
-    tmp_m = Vector{Float64}(undef, m)
-    obj_x = similar(x0)
+    # Latest objective/gradient point.
+    res = zeros(m)
+    obj_x = zeros(dim)
     obj_x_valid = Ref(false)
+    obj_value = Ref(0.0)
+    obj_value_valid = Ref(false)
 
-    function fill_res!(x)
-        mul!(res, A, x)
-        @inbounds @simd for i in eachindex(res, b)
-            res[i] -= b[i]
-        end
-        return res
-    end
-
-    function my_obj(x)
-        fill_res!(x)
-        copyto!(obj_x, x)
-        obj_x_valid[] = true
-        ss = 0.0
-        @inbounds @simd for i in eachindex(res)
-            ss += log1p(res[i]^2 / nu)
-        end
-        return ss
-    end
-
-    function my_grad!(g, x)
-        if !(obj_x_valid[] && isequal(x, obj_x))
-            fill_res!(x)
-        end
-        @inbounds @simd for i in eachindex(res, tmp_m)
-            ri = res[i]
-            tmp_m[i] = (2 * ri / nu) / (1 + ri^2 / nu)
-        end
-        mul!(g, transpose(A), tmp_m)
-        return g
-    end
-
-    hess_x = similar(x0)
+    # Fixed outer/Hessian point.
+    hess_res = zeros(m)
+    hess_coeff = zeros(m)
+    hess_x = zeros(dim)
     hess_x_valid = Ref(false)
-    hess_coeff = similar(coeff)
-    hess_res = similar(res)
 
-    function refresh_hess_cache!(x)
-        if !hess_x_valid[] || !isequal(x, hess_x)
-            mul!(hess_res, A, x)
-            @inbounds @simd for i in eachindex(hess_res, b)
-                hess_res[i] -= b[i]
+    # Trial relative to fixed Hessian point.
+    step = zeros(dim)
+    trial_d = zeros(m)
+    trial_x = zeros(dim)
+    trial_base_x = zeros(dim)
+    trial_d_valid = Ref(false)
+
+    # Gradient/HVP workspaces.
+    Av = zeros(m)
+    tmp = zeros(m)
+
+    # objdiff fallback.
+    diff_r = zeros(m)
+    diff_d = zeros(m)
+
+    function ensure_residual!(x)
+        if !obj_x_valid[] || !_same_problem_point(x, obj_x)
+            if hess_x_valid[] && !_same_problem_point(x, hess_x)
+                @inbounds @simd for i in eachindex(step)
+                    step[i] = x[i] - hess_x[i]
+                end
+
+                mul!(trial_d, A, step)
+
+                @inbounds @simd for i in eachindex(res, hess_res, trial_d)
+                    res[i] = hess_res[i] + trial_d[i]
+                end
+
+                copyto!(trial_x, x)
+                copyto!(trial_base_x, hess_x)
+                trial_d_valid[] = true
+            elseif hess_x_valid[]
+                copyto!(res, hess_res)
+                trial_d_valid[] = false
+            else
+                mul!(res, A, x)
+
+                @inbounds @simd for i in eachindex(res, b)
+                    res[i] -= b[i]
+                end
+
+                trial_d_valid[] = false
             end
-            @inbounds @simd for i in eachindex(hess_res, hess_coeff)
-                r2nu = hess_res[i]^2 / nu
-                denom = 1 + r2nu
-                hess_coeff[i] = (2 / nu * (1 - r2nu)) / (denom^2)
-            end
-            copyto!(hess_x, x)
-            hess_x_valid[] = true
+
+            copyto!(obj_x, x)
+            obj_x_valid[] = true
+            obj_value_valid[] = false
         end
         return nothing
     end
 
-    function my_hprod!(Hv, x, v)
-        refresh_hess_cache!(x)
-        mul!(Av, A, v)
-        @inbounds @simd for i in eachindex(tmp_m, hess_coeff, Av)
-            tmp_m[i] = hess_coeff[i] * Av[i]
+    function my_obj(x)
+        ensure_residual!(x)
+        obj_value_valid[] && return obj_value[]
+        total = 0.0
+
+        @inbounds @simd for i in eachindex(res)
+            total += log1p(res[i]^2 / nu)
         end
-        mul!(Hv, transpose(A), tmp_m)
+
+        obj_value[] = total
+        obj_value_valid[] = true
+        return total
+    end
+
+    function my_grad!(g, x)
+        ensure_residual!(x)
+
+        @inbounds @simd for i in eachindex(res, tmp)
+            ri = res[i]
+            tmp[i] = 2.0 * ri / (nu + ri^2)
+        end
+
+        mul!(g, A', tmp)
+        return g
+    end
+
+    function my_hprod!(Hv, x, v)
+        if !hess_x_valid[] || !_same_problem_point(x, hess_x)
+            if obj_x_valid[] && _same_problem_point(x, obj_x)
+                copyto!(hess_res, res)
+            else
+                mul!(hess_res, A, x)
+
+                @inbounds @simd for i in eachindex(hess_res, b)
+                    hess_res[i] -= b[i]
+                end
+            end
+
+            @inbounds @simd for i in eachindex(hess_res, hess_coeff)
+                ri = hess_res[i]
+                den = nu + ri^2
+                hess_coeff[i] = 2.0 * (nu - ri^2) / den^2
+            end
+
+            copyto!(hess_x, x)
+            hess_x_valid[] = true
+            trial_d_valid[] = false
+        end
+
+        mul!(Av, A, v)
+
+        @inbounds @simd for i in eachindex(tmp, hess_coeff, Av)
+            tmp[i] = hess_coeff[i] * Av[i]
+        end
+
+        mul!(Hv, A', tmp)
         return Hv
     end
 
-    return x0, my_obj, my_grad!, my_hprod!
+    function my_objdiff(x, trial)
+        if hess_x_valid[] && _same_problem_point(x, hess_x) &&
+           trial_d_valid[] && _same_problem_point(trial, trial_x) &&
+           _same_problem_point(x, trial_base_x)
+
+            r = hess_res
+            d = trial_d
+        else
+            mul!(diff_r, A, x)
+
+            @inbounds @simd for i in eachindex(diff_r, b)
+                diff_r[i] -= b[i]
+            end
+
+            @inbounds @simd for i in eachindex(step)
+                step[i] = trial[i] - x[i]
+            end
+
+            mul!(diff_d, A, step)
+
+            r = diff_r
+            d = diff_d
+        end
+
+        total = 0.0
+        correction = 0.0
+
+        @inbounds for i in eachindex(r, d)
+            ri = r[i]
+            di = d[i]
+
+            q = (2.0 * ri * di + di^2) / (nu + ri^2)
+
+            (!isfinite(q) || q <= -1.0) &&
+                return (NaN, Inf)
+
+            t = log1p(q)
+
+            z = total + t
+            correction +=
+                abs(total) >= abs(t) ?
+                (total - z) + t :
+                (t - z) + total
+
+            total = z
+        end
+
+        return total + correction, nothing
+    end
+
+    return x0, my_obj, my_grad!, my_hprod!, my_objdiff
 end
